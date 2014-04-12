@@ -1,0 +1,12 @@
+# Generic globs
+/core*
+/bin/core*
+*~
+
+# Specific paths
+/.build
+
+# Vim files
+.*.swp
+.*.swo
+
