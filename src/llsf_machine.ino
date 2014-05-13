@@ -22,15 +22,24 @@
 #include <TimerOne.h>
 #include <XBee.h>
 #include <SoftwareSerial.h>
+#include <SeeedRFIDLib.h>
 
+// *** PIN assignment for devices
 #define PIN_GREEN     7
 #define PIN_YELLOW    8
 #define PIN_RED       9
+
+#define PIN_RFID_RX   4
+#define PIN_RFID_TX   5
+#define PIN_RFID_POW  6
 
 #define PIN_DEBUG_RX 11
 #define PIN_DEBUG_TX 12
 
 #define PIN_ERR_LED  13
+
+
+#define RFID_TIMEOUT 1500
 
 /** Light signal state. */
 typedef enum {
@@ -44,6 +53,7 @@ typedef enum {
 #define ERR_UNKNOWN_PACKET    6
 #define ERR_SHORT_PACKET      7
 #define ERR_INVALID_RESPONSE  8
+#define ERR_INVALID_RFID_TAG  9
 
 static const char * ERROR_CODES[] = {
   "No error",
@@ -54,19 +64,22 @@ static const char * ERROR_CODES[] = {
   "RefBox unknown",
   "Unknown packet type",
   "Packet too short",
-  "Invalid response received"
+  "Invalid response received",
+  "Invalid tag read"
 };
 
 // *** network message types
 #define MSG_TYPE_SIGNAL_INSTRUCT  1
-#define MSG_TYPE_RFID_DATA        2
-#define MSG_TYPE_RFID_WRITE       3
 #define MSG_TYPE_SET_RED          2
 #define MSG_TYPE_SET_YELLOW       3
 #define MSG_TYPE_SET_GREEN        4
+#define MSG_TYPE_RFID_DATA        5
+#define MSG_TYPE_RFID_REMOVED     6
+#define MSG_TYPE_RFID_WRITE       7
 
 #pragma pack(push,1)
 typedef struct {
+  uint8_t  msg_type;
   uint32_t tag_id;
 } RFIDMessage;
 
@@ -82,6 +95,9 @@ XBeeAddress64 refbox_hw_addr_(0,0);
 uint16_t      refbox_net_addr_ = 0;
 uint8_t       refbox_dn_frame_id_ = 0;
 
+RFIDMessage   rfid_report_msg_;
+uint8_t       rfid_report_frame_id_ = 0;
+
 // *** Internal state info
 bool blink_state_ = false;
 SignalState state_red_    = SIGNAL_ON;
@@ -90,10 +106,14 @@ SignalState state_green_  = SIGNAL_ON;
 
 uint8_t     frame_id_     = 0;
 
+bool          rfid_visible_ = false;
+unsigned long rfid_last_seen_ = 0;
+
 
 // *** Interaction devices
 SoftwareSerial debug(PIN_DEBUG_RX, PIN_DEBUG_TX);
 XBee           xbee;
+SeeedRFIDLib   rfid(PIN_RFID_RX, PIN_RFID_TX);
 
 
 // from Ethernet library, repeat to avoid pulling in the whole thing
@@ -121,17 +141,24 @@ void setup()
   pinMode(PIN_RED,      OUTPUT);
 
   pinMode(PIN_ERR_LED,  OUTPUT);
+  pinMode(PIN_RFID_POW, OUTPUT);
 
   digitalWrite(PIN_GREEN,    HIGH);
   digitalWrite(PIN_YELLOW,   HIGH);
   digitalWrite(PIN_RED,      HIGH);
   digitalWrite(PIN_ERR_LED,  HIGH);
+  digitalWrite(PIN_RFID_POW, HIGH);
 
   Timer1.initialize(250000);
   Timer1.attachInterrupt(blink_timer);
 
   debug.begin(9600);
   debug.println("STARTED");
+
+  // Restart once to make the RFID's internal SoftwareSerial become
+  // the active listener -- there can only be one
+  // we don't care for reading on the debug SoftwareSerial anyway
+  rfid.restart();
 
   Serial.begin(9600);
   xbee.begin(Serial);
@@ -141,9 +168,11 @@ void setup()
 // *** Program loop
 void loop()
 {
-  if (refbox_hw_addr_.getMsb() == 0 && ! refbox_dn_running_) {
+  // if refbox address is unknown, send request. Re-send if the failed
+  if (refbox_hw_addr_.getMsb() == 0 && refbox_dn_frame_id_ == 0) {
     report_error(ERR_REFBOX_UNKNOWN);
     digitalWrite(PIN_ERR_LED, HIGH);
+    refbox_dn_frame_id_ = next_frame_id();
     AtCommandRequest req((uint8_t*)"DN", (uint8_t*)"RefBox", 6);
     req.setFrameId(refbox_dn_frame_id_);
     xbee.send(req);
@@ -268,13 +297,74 @@ void loop()
 	  digitalWrite(PIN_ERR_LED, LOW);
 	}
       }
+    } else if (xbee.getResponse().getApiId() == ZB_TX_STATUS_RESPONSE) {
+      ZBTxStatusResponse txr;
+      xbee.getResponse().getZBTxStatusResponse(txr);
+      uint8_t frame_id = txr.getFrameId();
+      if (rfid_report_frame_id_ == frame_id) {
+	rfid_report_frame_id_ = 0;
+      }
     } else {
       debug.println("Invalid response");
       report_error(ERR_INVALID_RESPONSE);
     }
   } // else no new data to process and no error
 
-  delay(50);
+  // Read and send RFID tag if received
+  // do not send if refbox address unknown or sending currently in progress
+  if (refbox_hw_addr_.getMsb() != 0 && rfid_report_frame_id_ == 0) {
+    if(rfid.isIdAvailable()) {
+      // we have an RFID tag, read it and send it if valid
+      RFIDTag tag = rfid.readId();
+      if (tag.valid) {
+	if (! rfid_visible_) {
+	  debug.print("RFID tag detected: ");
+	  debug.println(tag.id, HEX);
+	  rfid_visible_ = true;
+	}
+	rfid_last_seen_ = millis();
+
+	// restart RFID so we get continuous readings
+	digitalWrite(PIN_RFID_POW, LOW);
+	delay(5);
+	digitalWrite(PIN_RFID_POW, HIGH);
+	rfid.restart();
+
+	rfid_report_msg_.tag_id   = tag.id;
+
+	rfid_report_frame_id_ = next_frame_id();
+	rfid_report_msg_.msg_type = MSG_TYPE_RFID_DATA;
+      
+	ZBTxRequest txr(refbox_hw_addr_, (uint8_t*)&rfid_report_msg_, sizeof(RFIDMessage));
+	txr.setAddress16(refbox_net_addr_);
+	txr.setFrameId(rfid_report_frame_id_);
+	xbee.send(txr);
+      } else {
+	report_error(ERR_INVALID_RFID_TAG);
+      }
+    } else {
+      unsigned long now = millis();
+      if (now < rfid_last_seen_) {
+	debug.println("RFID last seen overflow");
+	// overflow, restart
+	rfid_last_seen_ = now;
+      }
+      if (rfid_visible_ && ((now - rfid_last_seen_) > RFID_TIMEOUT)) {
+	debug.println("RFID tag lost");
+	rfid_visible_ = false;
+
+	uint8_t msg_type = MSG_TYPE_RFID_REMOVED;
+
+	rfid_report_frame_id_ = next_frame_id();
+	ZBTxRequest txr(refbox_hw_addr_, &msg_type, 1);
+	txr.setAddress16(refbox_net_addr_);
+	txr.setFrameId(rfid_report_frame_id_);
+	xbee.send(txr);
+      }
+    }
+  }
+
+  delay(20);
 }
 
 
