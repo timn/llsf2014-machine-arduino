@@ -57,9 +57,13 @@ static const char * ERROR_CODES[] = {
   "Invalid response received"
 };
 
+// *** network message types
 #define MSG_TYPE_SIGNAL_INSTRUCT  1
 #define MSG_TYPE_RFID_DATA        2
 #define MSG_TYPE_RFID_WRITE       3
+#define MSG_TYPE_SET_RED          2
+#define MSG_TYPE_SET_YELLOW       3
+#define MSG_TYPE_SET_GREEN        4
 
 #pragma pack(push,1)
 typedef struct {
@@ -73,17 +77,24 @@ typedef struct {
 } SignalInstructMessage;
 #pragma pack(pop)
 
+// *** refbox address data
 XBeeAddress64 refbox_hw_addr_(0,0);
 uint16_t      refbox_net_addr_ = 0;
-bool          refbox_dn_running_ = false;
+uint8_t       refbox_dn_frame_id_ = 0;
 
+// *** Internal state info
 bool blink_state_ = false;
-SignalState state_red_    = SIGNAL_OFF;
-SignalState state_yellow_ = SIGNAL_OFF;
-SignalState state_green_  = SIGNAL_OFF;
+SignalState state_red_    = SIGNAL_ON;
+SignalState state_yellow_ = SIGNAL_ON;
+SignalState state_green_  = SIGNAL_ON;
 
-SoftwareSerial debug(PIN_DEBUG_RX, PIN_DEBUG_TX); // RX, TX
-XBee xbee;
+uint8_t     frame_id_     = 0;
+
+
+// *** Interaction devices
+SoftwareSerial debug(PIN_DEBUG_RX, PIN_DEBUG_TX);
+XBee           xbee;
+
 
 // from Ethernet library, repeat to avoid pulling in the whole thing
 #define htons(x) ( ((x)<<8) | (((x)>>8)&0xFF) )
@@ -95,18 +106,26 @@ XBee xbee;
                    ((x)>>24 & 0x000000FFUL) )
 #define ntohl(x) htonl(x)
 
+// *** Forward declarations
+void blink_timer();
+void update_lights();
+void report_error(uint8_t err_num);
+uint8_t next_frame_id();
+
+
+// *** Setup program
 void setup()
 {
-  pinMode(PIN_GREEN,   OUTPUT);
-  pinMode(PIN_YELLOW,  OUTPUT);
-  pinMode(PIN_RED,     OUTPUT);
+  pinMode(PIN_GREEN,    OUTPUT);
+  pinMode(PIN_YELLOW,   OUTPUT);
+  pinMode(PIN_RED,      OUTPUT);
 
-  pinMode(PIN_ERR_LED, OUTPUT);
+  pinMode(PIN_ERR_LED,  OUTPUT);
 
-  digitalWrite(PIN_GREEN,   LOW);
-  digitalWrite(PIN_YELLOW,  LOW);
-  digitalWrite(PIN_RED,     LOW);
-  digitalWrite(PIN_ERR_LED, HIGH);
+  digitalWrite(PIN_GREEN,    HIGH);
+  digitalWrite(PIN_YELLOW,   HIGH);
+  digitalWrite(PIN_RED,      HIGH);
+  digitalWrite(PIN_ERR_LED,  HIGH);
 
   Timer1.initialize(250000);
   Timer1.attachInterrupt(blink_timer);
@@ -118,16 +137,19 @@ void setup()
   xbee.begin(Serial);
 }
 
+
+// *** Program loop
 void loop()
 {
   if (refbox_hw_addr_.getMsb() == 0 && ! refbox_dn_running_) {
     report_error(ERR_REFBOX_UNKNOWN);
     digitalWrite(PIN_ERR_LED, HIGH);
     AtCommandRequest req((uint8_t*)"DN", (uint8_t*)"RefBox", 6);
+    req.setFrameId(refbox_dn_frame_id_);
     xbee.send(req);
-    refbox_dn_running_ = true;
   }
 
+  // Read incoming XBee messages
   xbee.readPacket();
   if (xbee.getResponse().isError()) {
     debug.print("Response Error: ");
@@ -169,6 +191,34 @@ void loop()
 	    debug.println("Invalid SignalInstructMessage data length");
 	  }
 	  break;
+
+	case MSG_TYPE_SET_RED:
+	  if (data_length == 2) {
+	    state_red_    = (SignalState)data[1];
+	    update_lights();
+	  } else {
+	    debug.println("Invalid SET_RED data length");
+	  }
+	  break;
+
+	case MSG_TYPE_SET_YELLOW:
+	  if (data_length == 2) {
+	    state_yellow_    = (SignalState)data[1];
+	    update_lights();
+	  } else {
+	    debug.println("Invalid SET_RED data length");
+	  }
+	  break;
+
+	case MSG_TYPE_SET_GREEN:
+	  if (data_length == 2) {
+	    state_green_    = (SignalState)data[1];
+	    update_lights();
+	  } else {
+	    debug.println("Invalid SET_RED data length");
+	  }
+	  break;
+
 	default: // unknown packet type
 	  debug.print("Received unknown packet");
 	  report_error(ERR_UNKNOWN_PACKET);
@@ -181,14 +231,14 @@ void loop()
     } else if (xbee.getResponse().getApiId() == MODEM_STATUS_RESPONSE) {
       ModemStatusResponse msr;
       xbee.getResponse().getModemStatusResponse(msr);
-      debug.print("Modem status:");
+      debug.print("Modem status: ");
       debug.println(msr.getStatus());
     } else if (xbee.getResponse().getApiId() == AT_COMMAND_RESPONSE) {
       AtCommandResponse atr;
       xbee.getResponse().getAtCommandResponse(atr);
       uint8_t *command = atr.getCommand();
-      if (command[0] == 'D' && command[1] == 'N') {
-	refbox_dn_running_ = false;
+      if (command[0] == 'D' && command[1] == 'N' && atr.getFrameId() == refbox_dn_frame_id_) {
+	refbox_dn_frame_id_ = 0;
 
 	if (atr.getStatus() == SUCCESS) {
 	  uint8_t *payload = atr.getValue();
@@ -208,6 +258,11 @@ void loop()
 	  for (int i = 0; i < 2; ++i)  debug.print(payload[i], HEX);
 	  debug.print("  HW ");
 	  for (int i = 2; i < 10; ++i)  debug.print(payload[i], HEX);
+	  debug.print(" (");
+	  debug.print(refbox_hw_addr_.getMsb(), HEX);
+	  debug.print(" ");
+	  debug.print(refbox_hw_addr_.getLsb(), HEX);
+	  debug.print(")");
 	  debug.println("");
 
 	  digitalWrite(PIN_ERR_LED, LOW);
@@ -239,8 +294,7 @@ void blink_timer()
 }
 
 
-void
-update_lights()
+void update_lights()
 {
   if (state_red_ == SIGNAL_OFF) {
     debug.println("Red OFF");
@@ -267,8 +321,7 @@ update_lights()
   }
 }
 
-void
-report_error(uint8_t err_num)
+void report_error(uint8_t err_num)
 {
   debug.print("Error: "); debug.print(err_num);
   debug.print(" - "); debug.println(ERROR_CODES[err_num]);
@@ -282,4 +335,11 @@ report_error(uint8_t err_num)
     digitalWrite(PIN_ERR_LED, LOW);
     delay(200);
   }
+}
+
+uint8_t next_frame_id()
+{
+  // zero means ignore frame id
+  if (++frame_id_ == 0)  frame_id_ = 1;
+  return frame_id_;
 }
